@@ -6,7 +6,7 @@ A layered Retrieval-Augmented Generation (RAG) system for querying patient medic
 
 ## 🚀 Live Demo
 
-[**medical-rag.streamlit.app**] https://medicalrag-a49jzxrqf5afsqynfmclpk.streamlit.app/
+ https://medicalrag-a49jzxrqf5afsqynfmclpk.streamlit.app/
 
 ---
 
