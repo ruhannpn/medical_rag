@@ -7,7 +7,9 @@ import streamlit as st
 from rank_bm25 import BM25Okapi
 
 # Add src directory to path so we can import existing modules
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_ROOT, 'src'))  # Streamlit Cloud: app.py at root, modules in src/
+sys.path.insert(0, _ROOT)                        # local: app.py inside src/
 
 from generator import (
     _load_env,
