@@ -48,3 +48,12 @@ typer==0.24.1
 typer-slim==0.24.0
 typing-inspection==0.4.2
 typing_extensions==4.15.0
+streamlit
+groq
+rank-bm25
+transformers
+sentence-transformers
+numpy
+pymupdf
+python-dotenv
+torch
