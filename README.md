@@ -158,4 +158,4 @@ python-dotenv
 
 ## 👤 Author
 
-Built by **Ruhan** — [github.com/yourusername] https://github.com/ruhannpn
+Built by **Ruhan** —  https://github.com/ruhannpn
