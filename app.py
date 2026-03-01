@@ -808,13 +808,35 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 if not st.session_state.indexed:
+    # Mobile-friendly upload — show uploader directly in main area
     st.markdown("""
     <div class="empty-state">
         <div class="empty-icon">📂</div>
-        <div class="empty-title">No records loaded</div>
-        <div class="empty-sub">Upload patient PDF files in the sidebar<br>and click Index Documents to begin.</div>
+        <div class="empty-title">Upload Patient Records</div>
+        <div class="empty-sub">Drop your PDF files below to get started.</div>
     </div>
     """, unsafe_allow_html=True)
+
+    mobile_files = st.file_uploader(
+        "Upload PDF files",
+        type=["pdf"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+    )
+    if mobile_files:
+        if st.button("⟳  Index Documents", use_container_width=True, type="primary"):
+            with st.spinner("Processing..."):
+                embed_model = get_embed_model()
+                docs, chunks = process_uploaded_files(mobile_files)
+                embeddings, bm25 = build_index(chunks, embed_model)
+                st.session_state.update({
+                    "documents": docs, "all_chunks": chunks,
+                    "embeddings": embeddings, "bm25": bm25,
+                    "embed_model": embed_model,
+                    "llm_client": get_llm_client(),
+                    "indexed": True, "chat_history": [],
+                })
+            st.rerun()
     st.stop()
 
 tab_chat, tab_report = st.tabs(["  💬  Chat  ", "  📋  Patient Reports  "])
