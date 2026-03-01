@@ -384,6 +384,10 @@ def classify_and_answer(query: str, documents: list) -> str | None:
 
     # Intent 1: Explicit report/summary request
     if _REPORT_TRIGGERS.search(q):
+        # Only intercept if it's clearly a data listing request
+        # "give me a detailed view" or "give me history" should go to LLM
+        if re.search(r"\b(detail|history|explain|view|insight|about|overview of|breakdown)\b", q):
+            return None
         fields = detect_requested_fields(query)
         return build_custom_report(documents, fields)
 
