@@ -6,3 +6,9 @@ __pycache__/
 .DS_Store
 *.log
 env
+
+# Database and indices
+*.db
+data/indices/
+scratch/
+.streamlit/

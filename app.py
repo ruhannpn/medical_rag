@@ -4,22 +4,22 @@ import re
 import tempfile
 import numpy as np
 import streamlit as st
-from rank_bm25 import BM25Okapi
 
 # Add src directory to path
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_ROOT, 'src'))
 sys.path.insert(0, _ROOT)
 
+from database import DatabaseManager
+from auth import AuthManager
+from extractor import ClinicalExtractor
+from retriever import RAGIndex
+
 from generator import (
     _load_env, load_llm, generate_answer, chunk_text,
-    classify_and_answer, hybrid_retrieval, score_confidence,
-    extract_name, extract_age, extract_gender, extract_diagnosis,
-    extract_medications, extract_symptoms, extract_allergies,
-    extract_dob, extract_visit_date, FIELD_REGISTRY,
+    classify_and_answer, score_confidence,
 )
-from ingest import extract_text_from_pdf
-from embedding import load_embedding_model, generate_embeddings
+from ingest import extract_multimodal
 
 # =================================================
 # PAGE CONFIG
@@ -482,26 +482,11 @@ pre, code {
 
 
 # =================================================
-# SESSION STATE
-# =================================================
-def init_state():
-    defaults = {
-        "documents": [], "all_chunks": [], "embeddings": None,
-        "bm25": None, "embed_model": None, "llm_client": None,
-        "chat_history": [], "indexed": False,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-init_state()
-
-
-# =================================================
 # RESOURCE LOADERS
 # =================================================
 @st.cache_resource(show_spinner="Loading embedding model...")
 def get_embed_model():
+    from embedding import load_embedding_model
     return load_embedding_model()
 
 
@@ -511,60 +496,63 @@ def get_llm_client():
         if "GROQ_API_KEY" in st.secrets:
             os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
     except Exception:
-        pass  # no secrets file locally — fall through to .env
-    _load_env()  # always try .env as fallback
+        pass
+    _load_env()
     return load_llm()
 
 
 # =================================================
-# DOCUMENT PROCESSING
+# DATABASE & AUTH INITIALIZATION
 # =================================================
-def process_uploaded_files(uploaded_files):
-    raw_documents, all_chunks = [], []
-    seen_names = set()
-    documents = []
+db = DatabaseManager()
+auth = AuthManager(db)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        for uf in uploaded_files:
-            path = os.path.join(tmpdir, uf.name)
-            with open(path, "wb") as f:
-                f.write(uf.read())
-            raw_text = extract_text_from_pdf(path)
-            raw_documents.append({"doc_id": uf.name, "raw_text": raw_text})
-            for chunk in chunk_text(raw_text):
-                all_chunks.append({"doc_id": uf.name, "content": chunk})
+# Render authentication UI if not logged in
+if "logged_in" not in st.session_state or not st.session_state.logged_in:
+    auth.render_auth_page()
+    st.stop()
 
-    for doc in raw_documents:
-        name = extract_name(doc["raw_text"])
-        key = name.strip().lower() if name else doc["doc_id"]
-        if key not in seen_names:
-            seen_names.add(key)
-            documents.append(doc)
-
-    return documents, all_chunks
-
-
-def build_index(all_chunks, embed_model):
-    texts = [c["content"] for c in all_chunks]
-    embeddings = generate_embeddings(embed_model, texts)
-    bm25 = BM25Okapi([re.findall(r"\w+", t.lower()) for t in texts])
-    return embeddings, bm25
+user_id = st.session_state.user_id
+username = st.session_state.username
 
 
 # =================================================
-# COMPONENTS
+# SESSION STATE INITIALIZATION
+# =================================================
+def init_user_state():
+    if "embed_model" not in st.session_state or st.session_state.embed_model is None:
+        st.session_state.embed_model = get_embed_model()
+    if "llm_client" not in st.session_state or st.session_state.llm_client is None:
+        st.session_state.llm_client = get_llm_client()
+        
+    if "rag_index" not in st.session_state or st.session_state.rag_index is None:
+        index = RAGIndex()
+        # Load user chunks and index
+        chunks = db.get_patient_chunks(user_id)
+        index.load(user_id, chunks)
+        st.session_state.rag_index = index
+        
+    # Always read fresh state from DB to sync UI
+    st.session_state.chat_history = db.get_chat_history(user_id)
+    st.session_state.documents = db.get_patients(user_id)
+    st.session_state.indexed = len(st.session_state.documents) > 0
+
+init_user_state()
+
+
+# =================================================
+# PATIENT CARD RENDERING
 # =================================================
 def render_patient_card(doc: dict):
-    t = doc["raw_text"]
-    name  = extract_name(t)       or "Unknown"
-    age   = extract_age(t)        or "N/A"
-    gender= extract_gender(t)     or "N/A"
-    dob   = extract_dob(t)        or "N/A"
-    vdate = extract_visit_date(t) or "N/A"
-    diag  = extract_diagnosis(t)  or "N/A"
-    meds  = extract_medications(t)
-    syms  = extract_symptoms(t)
-    allg  = extract_allergies(t)
+    name  = doc.get("name") or "Unknown"
+    age   = doc.get("age") or "N/A"
+    gender= doc.get("gender") or "N/A"
+    dob   = doc.get("dob") or "N/A"
+    vdate = doc.get("visit_date") or "N/A"
+    diag  = doc.get("diagnosis") or "N/A"
+    meds  = doc.get("medications") or []
+    syms  = doc.get("symptoms") or []
+    allg  = doc.get("allergies") or []
 
     med_tags = "".join(f'<span class="med-tag">{m}</span>' for m in meds) if meds else '<span style="color:#2a4060;font-size:0.78rem;">None on record</span>'
     sym_val  = ", ".join(syms) if syms else "N/A"
@@ -638,7 +626,6 @@ def render_confidence(conf: dict):
     """, unsafe_allow_html=True)
 
 
-
 def render_structured_response(text: str):
     """Render structured layer output as clean patient cards."""
     lines = text.split("\n")
@@ -669,7 +656,6 @@ def render_structured_response(text: str):
         patients.append(current)
 
     import streamlit.components.v1 as components
-    # Render all cards in one call via components.html — bypasses Streamlit HTML sanitization
     cards_html = []
     for p in patients:
         name = p["Name"]
@@ -734,32 +720,79 @@ with st.sidebar:
     </div>
     """, unsafe_allow_html=True)
 
+    # Auth Status
+    st.markdown(f"""
+    <div style="background: #0d1929; border: 1px solid #1a2e47; border-radius: 8px; padding: 10px; margin-bottom: 15px; text-align: center;">
+        <span style="font-size: 0.72rem; color: #4a6080; text-transform: uppercase; display: block; margin-bottom: 2px;">User Account</span>
+        <span style="font-weight: 600; color: #00a3ff; font-size: 0.95rem;">{username}</span>
+    </div>
+    """, unsafe_allow_html=True)
+
     st.markdown('<div class="sidebar-section">Upload Records</div>', unsafe_allow_html=True)
     uploaded_files = st.file_uploader(
-        "Drop PDFs", type=["pdf"],
+        "Drop PDFs or Images", type=["pdf", "png", "jpg", "jpeg"],
         accept_multiple_files=True,
         label_visibility="collapsed",
     )
 
     if uploaded_files:
         if st.button("⟳  Index Documents", use_container_width=True):
-            with st.spinner("Processing..."):
-                embed_model = get_embed_model()
-                docs, chunks = process_uploaded_files(uploaded_files)
-                embeddings, bm25 = build_index(chunks, embed_model)
-                st.session_state.update({
-                    "documents": docs, "all_chunks": chunks,
-                    "embeddings": embeddings, "bm25": bm25,
-                    "embed_model": embed_model,
-                    "llm_client": get_llm_client(),
-                    "indexed": True, "chat_history": [],
-                })
-            st.success(f"Indexed {len(docs)} patient(s)")
+            with st.spinner("Processing & Extracting..."):
+                new_chunks_to_index = []
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    for uf in uploaded_files:
+                        path = os.path.join(tmpdir, uf.name)
+                        with open(path, "wb") as f:
+                            f.write(uf.read())
+                        
+                        # 1. Parse text from PDF/Image
+                        try:
+                            raw_text = extract_multimodal(path)
+                        except EnvironmentError as e:
+                            st.error(str(e))
+                            st.stop()
+                        
+                        # 2. Extract clinical patient profile using LLM + Regex
+                        meta = ClinicalExtractor.extract(raw_text, st.session_state.llm_client)
+                        patient_name = meta.get("name")
+                        
+                        # Deduplicate by Patient Name (Delete older one if it exists to refresh it)
+                        if patient_name:
+                            existing = [p for p in st.session_state.documents if p["name"] and p["name"].strip().lower() == patient_name.strip().lower()]
+                            if existing:
+                                for p in existing:
+                                    with db._get_connection() as conn:
+                                        conn.execute("DELETE FROM patients WHERE id = ?;", (p["id"],))
+                        
+                        # 3. Save patient details to DB
+                        patient_id = db.add_patient(user_id, uf.name, raw_text, meta)
+                        
+                        # 4. Chunk and save to chunks table
+                        chunks = chunk_text(raw_text)
+                        db.add_chunks(patient_id, chunks)
+                        
+                        for chunk in chunks:
+                            new_chunks_to_index.append({
+                                "content": chunk,
+                                "doc_id": uf.name,
+                                "patient_id": patient_id
+                            })
+                            
+                # 5. Build/Update vector index and save
+                if new_chunks_to_index:
+                    st.session_state.rag_index.build_or_update(new_chunks_to_index, st.session_state.embed_model)
+                    st.session_state.rag_index.save(user_id)
+                
+                # Refresh session state
+                init_user_state()
+                
+            st.success(f"Indexed {len(uploaded_files)} patient(s)")
+            st.rerun()
 
     if st.session_state.indexed:
         st.markdown('<div class="sidebar-section">Patients</div>', unsafe_allow_html=True)
         for doc in st.session_state.documents:
-            name = extract_name(doc["raw_text"]) or doc["doc_id"]
+            name = doc["name"] or doc["doc_id"]
             st.markdown(f"""
             <div class="patient-pill">
                 <div class="patient-pill-dot"></div>
@@ -768,19 +801,36 @@ with st.sidebar:
             """, unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("✕  Clear All", use_container_width=True):
-            for k in ["documents", "all_chunks", "embeddings", "bm25",
-                      "embed_model", "llm_client", "chat_history"]:
-                st.session_state[k] = [] if isinstance(st.session_state[k], list) else None
-            st.session_state.indexed = False
+        
+        # Log Out Button
+        if st.button("🚪  Log Out", use_container_width=True):
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            st.rerun()
+
+        # Clear All Button
+        if st.button("✕  Clear All Records", use_container_width=True):
+            with st.spinner("Clearing user records..."):
+                db.clear_user_data(user_id)
+                st.session_state.rag_index.clear(user_id)
+                init_user_state()
+            st.success("All records cleared!")
+            st.rerun()
+            
+    else:
+        # Simple logout if no records exist
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🚪  Log Out", use_container_width=True):
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
             st.rerun()
 
 
 # =================================================
-# MAIN
+# MAIN SCREEN
 # =================================================
 n_patients = len(st.session_state.documents)
-n_chunks   = len(st.session_state.all_chunks)
+n_chunks   = len(st.session_state.rag_index.chunks)
 n_msgs     = len([m for m in st.session_state.chat_history if m["role"] == "user"])
 
 st.markdown(f"""
@@ -808,7 +858,7 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 if not st.session_state.indexed:
-    # Mobile-friendly upload — show uploader directly in main area
+    # Mobile-friendly / empty state upload card
     st.markdown("""
     <div class="empty-state">
         <div class="empty-icon">📂</div>
@@ -818,24 +868,52 @@ if not st.session_state.indexed:
     """, unsafe_allow_html=True)
 
     mobile_files = st.file_uploader(
-        "Upload PDF files",
-        type=["pdf"],
+        "Upload Medical Records",
+        type=["pdf", "png", "jpg", "jpeg"],
         accept_multiple_files=True,
         label_visibility="collapsed",
     )
     if mobile_files:
         if st.button("⟳  Index Documents", use_container_width=True, type="primary"):
-            with st.spinner("Processing..."):
-                embed_model = get_embed_model()
-                docs, chunks = process_uploaded_files(mobile_files)
-                embeddings, bm25 = build_index(chunks, embed_model)
-                st.session_state.update({
-                    "documents": docs, "all_chunks": chunks,
-                    "embeddings": embeddings, "bm25": bm25,
-                    "embed_model": embed_model,
-                    "llm_client": get_llm_client(),
-                    "indexed": True, "chat_history": [],
-                })
+            with st.spinner("Processing & Extracting..."):
+                new_chunks_to_index = []
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    for uf in mobile_files:
+                        path = os.path.join(tmpdir, uf.name)
+                        with open(path, "wb") as f:
+                            f.write(uf.read())
+                        
+                        try:
+                            raw_text = extract_multimodal(path)
+                        except EnvironmentError as e:
+                            st.error(str(e))
+                            st.stop()
+                        meta = ClinicalExtractor.extract(raw_text, st.session_state.llm_client)
+                        patient_name = meta.get("name")
+                        
+                        if patient_name:
+                            existing = [p for p in st.session_state.documents if p["name"] and p["name"].strip().lower() == patient_name.strip().lower()]
+                            if existing:
+                                for p in existing:
+                                    with db._get_connection() as conn:
+                                        conn.execute("DELETE FROM patients WHERE id = ?;", (p["id"],))
+                        
+                        patient_id = db.add_patient(user_id, uf.name, raw_text, meta)
+                        chunks = chunk_text(raw_text)
+                        db.add_chunks(patient_id, chunks)
+                        
+                        for chunk in chunks:
+                            new_chunks_to_index.append({
+                                "content": chunk,
+                                "doc_id": uf.name,
+                                "patient_id": patient_id
+                            })
+                            
+                if new_chunks_to_index:
+                    st.session_state.rag_index.build_or_update(new_chunks_to_index, st.session_state.embed_model)
+                    st.session_state.rag_index.save(user_id)
+                
+                init_user_state()
             st.rerun()
     st.stop()
 
@@ -846,61 +924,98 @@ with tab_chat:
     for msg in st.session_state.chat_history:
         with st.chat_message(msg["role"]):
             if msg["role"] == "assistant":
-                st.markdown(f'<div class="answer-block">{msg["content"]}</div>', unsafe_allow_html=True)
                 if msg.get("source") == "structured":
+                    render_structured_response(msg["content"])
                     st.markdown('<span class="source-tag source-structured">⚡ Structured Layer</span>', unsafe_allow_html=True)
                 else:
+                    st.markdown(f'<div class="answer-block">{msg["content"]}</div>', unsafe_allow_html=True)
                     st.markdown('<span class="source-tag source-llm">🤖 Llama 3.3 70B</span>', unsafe_allow_html=True)
                 if msg.get("confidence"):
                     render_confidence(msg["confidence"])
             else:
                 st.markdown(msg["content"])
 
-    query = st.chat_input("Ask anything about your patients...")
-    if query:
+    prompt = st.chat_input("Ask anything about your patients...", accept_file=True)
+    if prompt:
+        query = prompt.text if prompt.text else ""
+        attached_files = prompt.files
+        
+        display_query = query
+        if attached_files:
+            display_query += f"\n*(Attached {len(attached_files)} file(s))*"
+            
+        # Save user query to DB
+        db.save_chat_message(user_id, "user", display_query)
+        
         with st.chat_message("user"):
-            st.markdown(query)
-        st.session_state.chat_history.append({"role": "user", "content": query})
+            st.markdown(display_query)
+            for f in attached_files:
+                ext = f.name.lower().split('.')[-1]
+                if ext in ['png', 'jpg', 'jpeg']:
+                    st.image(f, width=300)
+                else:
+                    st.caption(f"📎 {f.name}")
+        
+        # Check structured classification path (skip if file is attached since we need the LLM to analyze it)
+        structured = classify_and_answer(query, st.session_state.documents) if not attached_files else None
 
         with st.chat_message("assistant"):
-            with st.spinner(""):
-                structured = classify_and_answer(query, st.session_state.documents)
-
             if structured:
                 render_structured_response(structured)
                 st.markdown('<span class="source-tag source-structured">⚡ Structured Layer</span>', unsafe_allow_html=True)
-                st.session_state.chat_history.append({
-                    "role": "assistant", "content": structured, "source": "structured",
-                })
+                db.save_chat_message(user_id, "assistant", structured, source="structured")
             else:
-                with st.spinner("Querying Llama 3.3 70B..."):
-                    top_indices = hybrid_retrieval(
-                        query, st.session_state.all_chunks,
-                        st.session_state.embed_model,
-                        st.session_state.embeddings,
-                        st.session_state.bm25,
-                    )
-                    context = "".join(
-                        f"[{st.session_state.all_chunks[i]['doc_id']}]\n{st.session_state.all_chunks[i]['content']}\n\n"
-                        for i in top_indices
-                    )
-                    answer = generate_answer(st.session_state.llm_client, query, context)
-                    query_emb  = generate_embeddings(st.session_state.embed_model, [query])[0]
-                    raw_scores = np.dot(st.session_state.embeddings, query_emb)
-                    top_scores = raw_scores[top_indices]
-                    top_scores = (top_scores - np.min(raw_scores)) / (np.max(raw_scores) - np.min(raw_scores) + 1e-8)
-                    conf = score_confidence(query, answer, context, top_scores)
-
+                with st.spinner("Analyzing query & files..."):
+                    # Process attached files for context
+                    file_context = ""
+                    if attached_files:
+                        with tempfile.TemporaryDirectory() as tmpdir:
+                            for uf in attached_files:
+                                path = os.path.join(tmpdir, uf.name)
+                                with open(path, "wb") as f_out:
+                                    f_out.write(uf.read())
+                                try:
+                                    text = extract_multimodal(path)
+                                    file_context += f"[Attached File: {uf.name}]\n{text}\n\n"
+                                except EnvironmentError as e:
+                                    st.error(str(e))
+                                    st.stop()
+                    
+                    # Ensure we have a text query for the LLM
+                    actual_query = query if query.strip() else "Please analyze the attached medical document."
+                    
+                    # Retrieve top chunks from RAGIndex if query is meaningful
+                    context = file_context
+                    top_scores = {}
+                    if query.strip():
+                        top_indices = st.session_state.rag_index.search(
+                            query, st.session_state.embed_model, top_k=5
+                        )
+                        context += "".join(
+                            f"[{st.session_state.rag_index.chunks[i]['doc_id']}]\n{st.session_state.rag_index.chunks[i]['content']}\n\n"
+                            for i in top_indices
+                        )
+                        top_scores = st.session_state.rag_index.get_chunk_scores(
+                            query, st.session_state.embed_model, top_indices
+                        )
+                    
+                    answer = generate_answer(st.session_state.llm_client, actual_query, context)
+                    
+                    # Calculate confidence
+                    conf = score_confidence(actual_query, answer, context, top_scores)
+                    
                 st.markdown(f'<div class="answer-block">{answer}</div>', unsafe_allow_html=True)
                 st.markdown('<span class="source-tag source-llm">🤖 Llama 3.3 70B</span>', unsafe_allow_html=True)
                 render_confidence(conf)
-                st.session_state.chat_history.append({
-                    "role": "assistant", "content": answer,
-                    "source": "llm", "confidence": conf,
-                })
+                
+                db.save_chat_message(user_id, "assistant", answer, source="llm", confidence=conf)
+        
+        # Rerun to sync DB chat history with UI
+        st.rerun()
 
     if st.session_state.chat_history:
         if st.button("✕  Clear chat"):
+            db.clear_chat_history(user_id)
             st.session_state.chat_history = []
             st.rerun()
 
